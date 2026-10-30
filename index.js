@@ -2,6 +2,7 @@ import express from "express";
 import cors from "cors";
 import dotenv from "dotenv";
 import { MongoClient, ObjectId } from "mongodb";
+import { jwtVerify, createRemoteJWKSet } from "jose";
 
 dotenv.config();
 
@@ -25,15 +26,19 @@ if (!uri) {
   throw new Error("MONGODB_URI is not configured in .env");
 }
 
+// Must match BetterAuth's BETTER_AUTH_URL exactly.
+const AUTH_BASE_URL = process.env.AUTH_BASE_URL?.replace(/\/+$/, "");
+
+if (!AUTH_BASE_URL) {
+  throw new Error("AUTH_BASE_URL is not configured in .env");
+}
+
 const client = new MongoClient(uri);
 
-const allowedCategories = [
-  "Fiction",
-  "Science",
-  "History",
-  "Kids",
-  "Others",
-];
+const allowedCategories = ["Fiction", "Science", "History", "Kids", "Others"];
+
+// BetterAuth JWKS public key endpoint
+const JWKS = createRemoteJWKSet(new URL(`${AUTH_BASE_URL}/api/auth/jwks`));
 
 // ========================================
 // HELPER FUNCTIONS
@@ -45,13 +50,7 @@ const normalizeEmail = (email) =>
   typeof email === "string" ? email.trim().toLowerCase() : "";
 
 const validateBookData = (data) => {
-  const {
-    title,
-    author,
-    category,
-    image,
-    description,
-  } = data;
+  const { title, author, category, image, description } = data;
 
   if (
     typeof title !== "string" ||
@@ -85,6 +84,62 @@ const validateBookData = (data) => {
 };
 
 // ========================================
+// JWT AUTHENTICATION MIDDLEWARE
+// ========================================
+
+const authenticateToken = async (req, res, next) => {
+  try {
+    const authHeader = req.headers.authorization;
+
+    if (!authHeader || !authHeader.startsWith("Bearer ")) {
+      return res.status(401).json({
+        success: false,
+        message: "Authentication required. Please login.",
+      });
+    }
+
+    const token = authHeader.split(" ")[1];
+
+    if (!token) {
+      return res.status(401).json({
+        success: false,
+        message: "JWT token is missing.",
+      });
+    }
+
+    const { payload } = await jwtVerify(token, JWKS, {
+      issuer: AUTH_BASE_URL,
+      audience: AUTH_BASE_URL,
+    });
+
+    const email = normalizeEmail(payload.email);
+
+    if (!email || typeof payload.sub !== "string") {
+      return res.status(401).json({
+        success: false,
+        message: "Invalid user information in token.",
+      });
+    }
+
+    // Verified identity from JWT, not from request body/query.
+    req.user = {
+      id: payload.sub,
+      email,
+      name: typeof payload.name === "string" ? payload.name : "",
+    };
+
+    next();
+  } catch (error) {
+    console.error("JWT Verification Error:", error.message);
+
+    return res.status(401).json({
+      success: false,
+      message: "Invalid or expired token. Please login again.",
+    });
+  }
+};
+
+// ========================================
 // SERVER
 // ========================================
 
@@ -101,10 +156,7 @@ async function run() {
 
     console.log("Connected Database:", db.databaseName);
     console.log("Total Books:", await booksCollection.countDocuments());
-    console.log(
-      "Total Borrows:",
-      await borrowsCollection.countDocuments()
-    );
+    console.log("Total Borrows:", await borrowsCollection.countDocuments());
 
     // ========================================
     // ROOT ROUTE
@@ -115,7 +167,7 @@ async function run() {
     });
 
     // ========================================
-    // API 1: GET ALL BOOKS
+    // API 1: GET ALL BOOKS (PUBLIC)
     // GET /api/books
     // ========================================
 
@@ -123,9 +175,7 @@ async function run() {
       try {
         const requestedLimit = Number.parseInt(req.query.limit, 10);
 
-        let query = booksCollection
-          .find()
-          .sort({ createdAt: -1, _id: -1 });
+        let query = booksCollection.find().sort({ createdAt: -1, _id: -1 });
 
         if (Number.isInteger(requestedLimit) && requestedLimit > 0) {
           query = query.limit(Math.min(requestedLimit, 100));
@@ -149,11 +199,11 @@ async function run() {
     });
 
     // ========================================
-    // API 2: GET SINGLE BOOK
+    // API 2: GET SINGLE BOOK (PROTECTED)
     // GET /api/books/:id
     // ========================================
 
-    app.get("/api/books/:id", async (req, res) => {
+    app.get("/api/books/:id", authenticateToken, async (req, res) => {
       try {
         const { id } = req.params;
 
@@ -191,35 +241,27 @@ async function run() {
     });
 
     // ========================================
-    // API 3: ADD NEW BOOK
+    // API 3: ADD NEW BOOK (PROTECTED)
     // POST /api/books
     // ========================================
 
-    app.post("/api/books", async (req, res) => {
+    app.post("/api/books", authenticateToken, async (req, res) => {
       try {
-        const {
-          title,
-          author,
-          category,
-          image,
-          description,
-          addedByName,
-          addedByEmail,
-        } = req.body;
+        const { title, author, category, image, description } = req.body;
 
         const validationError = validateBookData(req.body);
 
-        if (
-          validationError ||
-          typeof addedByName !== "string" ||
-          !addedByName.trim() ||
-          !normalizeEmail(addedByEmail)
-        ) {
+        if (validationError) {
           return res.status(400).json({
             success: false,
-            message:
-              validationError ||
-              "Please provide valid user information.",
+            message: validationError,
+          });
+        }
+
+        if (!req.user.name) {
+          return res.status(400).json({
+            success: false,
+            message: "Your account name is missing.",
           });
         }
 
@@ -229,8 +271,11 @@ async function run() {
           category,
           image: image.trim(),
           description: description.trim(),
-          addedByName: addedByName.trim(),
-          addedByEmail: normalizeEmail(addedByEmail),
+
+          // Always use verified JWT identity.
+          addedByName: req.user.name,
+          addedByEmail: req.user.email,
+
           createdAt: new Date(),
           updatedAt: null,
         };
@@ -256,23 +301,14 @@ async function run() {
     });
 
     // ========================================
-    // API 4: GET MY BOOKS
-    // GET /api/my-books?email=user@email.com
+    // API 4: GET MY BOOKS (PROTECTED)
+    // GET /api/my-books
     // ========================================
 
-    app.get("/api/my-books", async (req, res) => {
+    app.get("/api/my-books", authenticateToken, async (req, res) => {
       try {
-        const email = normalizeEmail(req.query.email);
-
-        if (!email) {
-          return res.status(400).json({
-            success: false,
-            message: "User email is required.",
-          });
-        }
-
         const books = await booksCollection
-          .find({ addedByEmail: email })
+          .find({ addedByEmail: req.user.email })
           .sort({ createdAt: -1 })
           .toArray();
 
@@ -292,35 +328,18 @@ async function run() {
     });
 
     // ========================================
-    // API 5: UPDATE BOOK
+    // API 5: UPDATE BOOK (PROTECTED)
     // PUT /api/books/:id
     // ========================================
 
-    app.put("/api/books/:id", async (req, res) => {
+    app.put("/api/books/:id", authenticateToken, async (req, res) => {
       try {
         const { id } = req.params;
-        const {
-          title,
-          author,
-          category,
-          image,
-          description,
-          addedByEmail,
-        } = req.body;
 
         if (!isValidObjectId(id)) {
           return res.status(400).json({
             success: false,
             message: "Invalid book ID.",
-          });
-        }
-
-        const email = normalizeEmail(addedByEmail);
-
-        if (!email) {
-          return res.status(400).json({
-            success: false,
-            message: "User email is required.",
           });
         }
 
@@ -344,12 +363,14 @@ async function run() {
           });
         }
 
-        if (existingBook.addedByEmail !== email) {
+        if (existingBook.addedByEmail !== req.user.email) {
           return res.status(403).json({
             success: false,
             message: "You cannot update another user's book.",
           });
         }
+
+        const { title, author, category, image, description } = req.body;
 
         const updatedData = {
           title: title.trim(),
@@ -362,7 +383,7 @@ async function run() {
 
         await booksCollection.updateOne(
           { _id: new ObjectId(id) },
-          { $set: updatedData }
+          { $set: updatedData },
         );
 
         const updatedBook = await booksCollection.findOne({
@@ -385,26 +406,18 @@ async function run() {
     });
 
     // ========================================
-    // API 6: DELETE BOOK
-    // DELETE /api/books/:id?email=user@email.com
+    // API 6: DELETE BOOK (PROTECTED)
+    // DELETE /api/books/:id
     // ========================================
 
-    app.delete("/api/books/:id", async (req, res) => {
+    app.delete("/api/books/:id", authenticateToken, async (req, res) => {
       try {
         const { id } = req.params;
-        const email = normalizeEmail(req.query.email);
 
         if (!isValidObjectId(id)) {
           return res.status(400).json({
             success: false,
             message: "Invalid book ID.",
-          });
-        }
-
-        if (!email) {
-          return res.status(400).json({
-            success: false,
-            message: "User email is required.",
           });
         }
 
@@ -419,7 +432,7 @@ async function run() {
           });
         }
 
-        if (existingBook.addedByEmail !== email) {
+        if (existingBook.addedByEmail !== req.user.email) {
           return res.status(403).json({
             success: false,
             message: "You cannot delete another user's book.",
@@ -445,27 +458,18 @@ async function run() {
     });
 
     // ========================================
-    // API 7: BORROW A BOOK
+    // API 7: BORROW A BOOK (PROTECTED)
     // POST /api/borrows
     // ========================================
 
-    app.post("/api/borrows", async (req, res) => {
+    app.post("/api/borrows", authenticateToken, async (req, res) => {
       try {
-        const { bookId, userName, userEmail } = req.body;
-
-        const email = normalizeEmail(userEmail);
+        const { bookId } = req.body;
 
         if (!bookId || !isValidObjectId(bookId)) {
           return res.status(400).json({
             success: false,
             message: "Valid book ID is required.",
-          });
-        }
-
-        if (!email || typeof userName !== "string" || !userName.trim()) {
-          return res.status(400).json({
-            success: false,
-            message: "Valid user information is required.",
           });
         }
 
@@ -480,10 +484,10 @@ async function run() {
           });
         }
 
-        // Prevent duplicate active borrow of the same book
+        // Prevent duplicate active borrow of the same book.
         const existingBorrow = await borrowsCollection.findOne({
           bookId: book._id.toString(),
-          userEmail: email,
+          userEmail: req.user.email,
           isReturned: false,
         });
 
@@ -503,8 +507,11 @@ async function run() {
           bookId: book._id.toString(),
           bookTitle: book.title,
           bookImage: book.image,
-          userName: userName.trim(),
-          userEmail: email,
+
+          // Always use verified JWT identity.
+          userName: req.user.name,
+          userEmail: req.user.email,
+
           borrowDate,
           returnDate,
           isReturned: false,
@@ -533,23 +540,14 @@ async function run() {
     });
 
     // ========================================
-    // API 8: GET MY BORROWS
-    // GET /api/borrows?email=user@email.com
+    // API 8: GET MY BORROWS (PROTECTED)
+    // GET /api/borrows
     // ========================================
 
-    app.get("/api/borrows", async (req, res) => {
+    app.get("/api/borrows", authenticateToken, async (req, res) => {
       try {
-        const email = normalizeEmail(req.query.email);
-
-        if (!email) {
-          return res.status(400).json({
-            success: false,
-            message: "User email is required.",
-          });
-        }
-
         const borrows = await borrowsCollection
-          .find({ userEmail: email })
+          .find({ userEmail: req.user.email })
           .sort({ borrowDate: -1 })
           .toArray();
 
@@ -569,26 +567,18 @@ async function run() {
     });
 
     // ========================================
-    // API 9: RETURN A BOOK
+    // API 9: RETURN A BOOK (PROTECTED)
     // PUT /api/borrows/:id/return
     // ========================================
 
-    app.put("/api/borrows/:id/return", async (req, res) => {
+    app.put("/api/borrows/:id/return", authenticateToken, async (req, res) => {
       try {
         const { id } = req.params;
-        const email = normalizeEmail(req.body.userEmail);
 
         if (!isValidObjectId(id)) {
           return res.status(400).json({
             success: false,
             message: "Invalid borrow ID.",
-          });
-        }
-
-        if (!email) {
-          return res.status(400).json({
-            success: false,
-            message: "User email is required.",
           });
         }
 
@@ -603,7 +593,7 @@ async function run() {
           });
         }
 
-        if (existingBorrow.userEmail !== email) {
+        if (existingBorrow.userEmail !== req.user.email) {
           return res.status(403).json({
             success: false,
             message: "You cannot return another user's borrowed book.",
@@ -618,13 +608,17 @@ async function run() {
         }
 
         await borrowsCollection.updateOne(
-          { _id: new ObjectId(id) },
+          {
+            _id: new ObjectId(id),
+            userEmail: req.user.email,
+            isReturned: false,
+          },
           {
             $set: {
               isReturned: true,
               returnedAt: new Date(),
             },
-          }
+          },
         );
 
         const updatedBorrow = await borrowsCollection.findOne({
@@ -665,6 +659,7 @@ async function run() {
 
     app.listen(PORT, () => {
       console.log(`Server running on port ${PORT}`);
+      console.log(`JWT Issuer: ${AUTH_BASE_URL}`);
     });
   } catch (error) {
     console.error("MongoDB Connection Failed:", error);
