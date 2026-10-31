@@ -8,10 +8,6 @@ dotenv.config();
 
 const app = express();
 
-// ========================================
-// MIDDLEWARE
-// ========================================
-
 app.use(cors());
 app.use(express.json());
 
@@ -26,7 +22,6 @@ if (!uri) {
   throw new Error("MONGODB_URI is not configured in .env");
 }
 
-// Must match BetterAuth's BETTER_AUTH_URL exactly.
 const AUTH_BASE_URL = process.env.AUTH_BASE_URL?.replace(/\/+$/, "");
 
 if (!AUTH_BASE_URL) {
@@ -37,7 +32,6 @@ const client = new MongoClient(uri);
 
 const allowedCategories = ["Fiction", "Science", "History", "Kids", "Others"];
 
-// BetterAuth JWKS public key endpoint
 const JWKS = createRemoteJWKSet(new URL(`${AUTH_BASE_URL}/api/auth/jwks`));
 
 // ========================================
@@ -121,7 +115,6 @@ const authenticateToken = async (req, res, next) => {
       });
     }
 
-    // Verified identity from JWT, not from request body/query.
     req.user = {
       id: payload.sub,
       email,
@@ -155,6 +148,40 @@ async function run() {
     const borrowsCollection = db.collection("borrows");
 
     console.log("Connected Database:", db.databaseName);
+
+    // ========================================
+    // MIGRATE OLD BOOKS
+    // Old books did not have totalCopies.
+    // Give them one available copy by default.
+    // ========================================
+
+    const migrationResult = await booksCollection.updateMany(
+      { totalCopies: { $exists: false } },
+      { $set: { totalCopies: 1 } },
+    );
+
+    console.log(
+      "Old books updated with default copies:",
+      migrationResult.modifiedCount,
+    );
+
+    // ========================================
+    // PREVENT DOUBLE ACTIVE BORROWS
+    // One user can have only one active borrow
+    // for the same book.
+    // ========================================
+
+    await borrowsCollection.createIndex(
+      { bookId: 1, userEmail: 1 },
+      {
+        unique: true,
+        partialFilterExpression: { isReturned: false },
+        name: "unique_active_borrow_per_user_book",
+      },
+    );
+
+    console.log("Borrow safety index ready.");
+
     console.log("Total Books:", await booksCollection.countDocuments());
     console.log("Total Borrows:", await borrowsCollection.countDocuments());
 
@@ -247,7 +274,8 @@ async function run() {
 
     app.post("/api/books", authenticateToken, async (req, res) => {
       try {
-        const { title, author, category, image, description } = req.body;
+        const { title, author, category, image, description, totalCopies } =
+          req.body;
 
         const validationError = validateBookData(req.body);
 
@@ -255,6 +283,15 @@ async function run() {
           return res.status(400).json({
             success: false,
             message: validationError,
+          });
+        }
+
+        const copies = Number(totalCopies);
+
+        if (!Number.isInteger(copies) || copies < 1 || copies > 10000) {
+          return res.status(400).json({
+            success: false,
+            message: "Total copies must be a whole number between 1 and 10000.",
           });
         }
 
@@ -272,7 +309,10 @@ async function run() {
           image: image.trim(),
           description: description.trim(),
 
-          // Always use verified JWT identity.
+          // Available copies
+          totalCopies: copies,
+
+          // Verified identity from JWT
           addedByName: req.user.name,
           addedByEmail: req.user.email,
 
@@ -439,6 +479,19 @@ async function run() {
           });
         }
 
+        // Do not delete a book that is currently borrowed.
+        const activeBorrow = await borrowsCollection.findOne({
+          bookId: id,
+          isReturned: false,
+        });
+
+        if (activeBorrow) {
+          return res.status(409).json({
+            success: false,
+            message: "This book cannot be deleted while it is borrowed.",
+          });
+        }
+
         await booksCollection.deleteOne({
           _id: new ObjectId(id),
         });
@@ -473,8 +526,10 @@ async function run() {
           });
         }
 
+        const bookObjectId = new ObjectId(bookId);
+
         const book = await booksCollection.findOne({
-          _id: new ObjectId(bookId),
+          _id: bookObjectId,
         });
 
         if (!book) {
@@ -484,9 +539,9 @@ async function run() {
           });
         }
 
-        // Prevent duplicate active borrow of the same book.
+        // Prevent an already active duplicate borrow.
         const existingBorrow = await borrowsCollection.findOne({
-          bookId: book._id.toString(),
+          bookId: bookId,
           userEmail: req.user.email,
           isReturned: false,
         });
@@ -495,6 +550,24 @@ async function run() {
           return res.status(409).json({
             success: false,
             message: "You have already borrowed this book.",
+          });
+        }
+
+        // Atomically reserve one available copy.
+        const stockResult = await booksCollection.updateOne(
+          {
+            _id: bookObjectId,
+            totalCopies: { $gt: 0 },
+          },
+          {
+            $inc: { totalCopies: -1 },
+          },
+        );
+
+        if (stockResult.modifiedCount !== 1) {
+          return res.status(409).json({
+            success: false,
+            message: "This book is currently not available.",
           });
         }
 
@@ -508,7 +581,6 @@ async function run() {
           bookTitle: book.title,
           bookImage: book.image,
 
-          // Always use verified JWT identity.
           userName: req.user.name,
           userEmail: req.user.email,
 
@@ -519,16 +591,33 @@ async function run() {
           createdAt: new Date(),
         };
 
-        const result = await borrowsCollection.insertOne(newBorrow);
+        try {
+          const result = await borrowsCollection.insertOne(newBorrow);
 
-        return res.status(201).json({
-          success: true,
-          message: "Book borrowed successfully!",
-          data: {
-            _id: result.insertedId,
-            ...newBorrow,
-          },
-        });
+          return res.status(201).json({
+            success: true,
+            message: "Book borrowed successfully!",
+            data: {
+              _id: result.insertedId,
+              ...newBorrow,
+            },
+          });
+        } catch (insertError) {
+          // Restore stock if saving the borrow record fails.
+          await booksCollection.updateOne(
+            { _id: bookObjectId },
+            { $inc: { totalCopies: 1 } },
+          );
+
+          if (insertError.code === 11000) {
+            return res.status(409).json({
+              success: false,
+              message: "You have already borrowed this book.",
+            });
+          }
+
+          throw insertError;
+        }
       } catch (error) {
         console.error("Borrow Book Error:", error);
 
@@ -582,8 +671,10 @@ async function run() {
           });
         }
 
+        const borrowObjectId = new ObjectId(id);
+
         const existingBorrow = await borrowsCollection.findOne({
-          _id: new ObjectId(id),
+          _id: borrowObjectId,
         });
 
         if (!existingBorrow) {
@@ -607,22 +698,40 @@ async function run() {
           });
         }
 
-        await borrowsCollection.updateOne(
+        // Mark this borrow as returned only once.
+        const returnTime = new Date();
+
+        const returnResult = await borrowsCollection.updateOne(
           {
-            _id: new ObjectId(id),
+            _id: borrowObjectId,
             userEmail: req.user.email,
             isReturned: false,
           },
           {
             $set: {
               isReturned: true,
-              returnedAt: new Date(),
+              returnedAt: returnTime,
             },
           },
         );
 
+        if (returnResult.modifiedCount !== 1) {
+          return res.status(409).json({
+            success: false,
+            message: "This book has already been returned.",
+          });
+        }
+
+        // Restore one available copy.
+        if (isValidObjectId(existingBorrow.bookId)) {
+          await booksCollection.updateOne(
+            { _id: new ObjectId(existingBorrow.bookId) },
+            { $inc: { totalCopies: 1 } },
+          );
+        }
+
         const updatedBorrow = await borrowsCollection.findOne({
-          _id: new ObjectId(id),
+          _id: borrowObjectId,
         });
 
         return res.status(200).json({
@@ -663,6 +772,7 @@ async function run() {
     });
   } catch (error) {
     console.error("MongoDB Connection Failed:", error);
+    process.exit(1);
   }
 }
 
