@@ -60,12 +60,19 @@ export default function borrowsRoutes({ booksCollection, borrowsCollection }) {
       const stockResult = await booksCollection.updateOne(
         {
           _id: bookObjectId,
-          totalCopies: { $gt: 0 },
+          availableCopies: { $gt: 0 },
         },
         {
-          $inc: { totalCopies: -1 },
+          $inc: { availableCopies: -1 },
         },
       );
+
+      if (stockResult.modifiedCount !== 1) {
+        return res.status(409).json({
+          success: false,
+          message: "This book is currently not available.",
+        });
+      }
 
       if (stockResult.modifiedCount !== 1) {
         return res.status(409).json({
@@ -109,7 +116,7 @@ export default function borrowsRoutes({ booksCollection, borrowsCollection }) {
         // Restore stock if saving the borrow record fails.
         await booksCollection.updateOne(
           { _id: bookObjectId },
-          { $inc: { totalCopies: 1 } },
+          { $inc: { availableCopies: 1 } },
         );
 
         if (insertError.code === 11000) {
@@ -218,8 +225,15 @@ export default function borrowsRoutes({ booksCollection, borrowsCollection }) {
       // Restore one available copy.
       if (isValidObjectId(existingBorrow.bookId)) {
         await booksCollection.updateOne(
-          { _id: new ObjectId(existingBorrow.bookId) },
-          { $inc: { totalCopies: 1 } },
+          {
+            _id: new ObjectId(existingBorrow.bookId),
+            $expr: {
+              $lt: ["$availableCopies", "$totalCopies"],
+            },
+          },
+          {
+            $inc: { availableCopies: 1 },
+          },
         );
       }
 

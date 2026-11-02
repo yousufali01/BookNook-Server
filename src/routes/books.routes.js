@@ -134,8 +134,9 @@ export default function booksRoutes({ booksCollection, borrowsCollection }) {
         image: image.trim(),
         description: description.trim(),
 
-        // Available copies
+        // Total and available copies
         totalCopies: copies,
+        availableCopies: copies,
 
         // Verified identity from JWT
         addedByName: req.user.name,
